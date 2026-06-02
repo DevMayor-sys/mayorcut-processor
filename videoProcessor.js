@@ -339,27 +339,41 @@ async function processVideo({ jobId, clips, reference, style, format, outputPath
       } catch { continue; }
 
       const { duration } = info;
-      const skip = duration * 0.08; // skip first/last 8%
+
+      // For short clips (under 10s) skip the 8% trim — use full clip
+      const skipPct = duration < 10 ? 0 : 0.08;
+      const skip = duration * skipPct;
       const usable = duration - skip * 2;
-      if (usable < preset.minSegment) continue;
+
+      // If entire clip is shorter than minSegment, use whole clip as one segment
+      if (usable <= preset.minSegment) {
+        if (duration >= 1.0) {
+          segments.push({ file: clip, start: 0, duration });
+          console.log(`[${jobId}] Short clip used as single segment: ${duration.toFixed(1)}s`);
+        }
+        continue;
+      }
 
       let t = skip;
-      while (t < skip + usable - preset.minSegment) {
+      while (t < skip + usable - 0.5) {
+        const remaining = (skip + usable) - t;
         // Snap cut point to nearest beat
-        const rawEnd = t + preset.segmentDuration;
+        const rawEnd = t + Math.min(preset.segmentDuration, remaining);
         const snappedEnd = snapToBeat(rawEnd, beats, preset.beatSyncTightness);
-        const segDur = Math.max(preset.minSegment, Math.min(snappedEnd - t, preset.segmentDuration * 1.5));
+        const segDur = Math.max(0.5, Math.min(snappedEnd - t, preset.segmentDuration * 1.5, remaining));
 
-        if (t + segDur <= skip + usable) {
-          segments.push({ file: clip, start: t, duration: segDur });
-        }
+        segments.push({ file: clip, start: t, duration: segDur });
         t += segDur;
+
+        if (t >= skip + usable - 0.3) break;
       }
     }
 
     if (!segments.length) {
-      throw new Error('No usable segments found. Clips may be too short (need 3s+ each).');
+      throw new Error('No usable segments found. Try uploading longer clips (3s minimum).');
     }
+
+    console.log(`[${jobId}] Planned ${segments.length} segments`);
 
     // Trim to max output duration
     let total = 0;
