@@ -1,11 +1,11 @@
 // ============================================================
-// Mayor Cut — Video Processor v4
+// Mayor Cut — Video Processor v5 COMPLETE
 // Mayor Tech Inc © 2026
 //
-// If reference video uploaded → uses Blueprint Engine
-// (frame-by-frame clone of the reference edit)
-//
-// If preset style selected → uses Style Presets
+// 3 MODES:
+// 1. BLUEPRINT — reference video uploaded → exact clone
+// 2. PRESET    — style selected → preset style
+// 3. AUTO      — nothing selected → Mayor Cut decides
 // ============================================================
 
 const ffmpeg = require('fluent-ffmpeg');
@@ -19,29 +19,96 @@ ffmpeg.setFfmpegPath(ffmpegStatic);
 // ── STYLE PRESETS ─────────────────────────────────────────────
 const STYLES = {
   'football-hype': {
-    label:'Football Hype', segmentDuration:1.5, minSegment:1.0, maxOutput:60,
-    fadeIn:0.12, fadeOut:0.12, speed:1.1, brightness:0.08, contrast:1.2, saturation:1.35,
-    beatSyncTightness:0.8, bpmRange:[128,160],
-    useFlashCuts:true, useZoomPunches:true, useShakeEffect:false, useSpeedRamps:false, lutStyle:'vibrant'
+    label:'Football Hype',segmentDuration:1.5,minSegment:1.0,maxOutput:60,
+    fadeIn:0.12,fadeOut:0.12,speed:1.1,brightness:0.08,contrast:1.2,saturation:1.35,
+    beatSyncTightness:0.8,bpmRange:[128,160],
+    useFlashCuts:true,useZoomPunches:true,useShakeEffect:false,useSpeedRamps:false,lutStyle:'vibrant'
   },
   'fast-cuts': {
-    label:'Fast Cuts', segmentDuration:1.2, minSegment:0.8, maxOutput:60,
-    fadeIn:0.08, fadeOut:0.08, speed:1.15, brightness:0.04, contrast:1.1, saturation:1.2,
-    beatSyncTightness:0.9, bpmRange:[120,150],
-    useFlashCuts:true, useZoomPunches:false, useShakeEffect:false, useSpeedRamps:false, lutStyle:'natural'
+    label:'Fast Cuts',segmentDuration:1.2,minSegment:0.8,maxOutput:60,
+    fadeIn:0.08,fadeOut:0.08,speed:1.15,brightness:0.04,contrast:1.1,saturation:1.2,
+    beatSyncTightness:0.9,bpmRange:[120,150],
+    useFlashCuts:true,useZoomPunches:false,useShakeEffect:false,useSpeedRamps:false,lutStyle:'natural'
   },
   'cinematic': {
-    label:'Cinematic', segmentDuration:3.5, minSegment:2.0, maxOutput:90,
-    fadeIn:0.5, fadeOut:0.5, speed:0.95, brightness:-0.06, contrast:1.25, saturation:0.8,
-    beatSyncTightness:0.5, bpmRange:[70,100],
-    useFlashCuts:false, useZoomPunches:false, useShakeEffect:false, useSpeedRamps:true, lutStyle:'dark-cinematic'
+    label:'Cinematic',segmentDuration:3.5,minSegment:2.0,maxOutput:90,
+    fadeIn:0.5,fadeOut:0.5,speed:0.95,brightness:-0.06,contrast:1.25,saturation:0.8,
+    beatSyncTightness:0.5,bpmRange:[70,100],
+    useFlashCuts:false,useZoomPunches:false,useShakeEffect:false,useSpeedRamps:true,lutStyle:'dark-cinematic'
   }
 };
 
-const FORMATS = {
-  '9:16': {w:1080,h:1920}, '1:1':{w:1080,h:1080},
-  '16:9':{w:1920,h:1080},  'source':null
-};
+const FORMATS={'9:16':{w:1080,h:1920},'1:1':{w:1080,h:1080},'16:9':{w:1920,h:1080},'source':null};
+
+// ── AUTO STYLE DETECTION ──────────────────────────────────────
+// Analyzes clips and picks the best style automatically
+async function detectAutoStyle(clips, jobId) {
+  console.log(`[${jobId}] 🤖 AUTO MODE — analyzing clips...`);
+  try {
+    const clip = clips[0];
+    const info = await getVideoInfo(clip);
+    const audioPath = `/tmp/auto_audio_${jobId}.wav`;
+    await extractAudio(clip, audioPath);
+
+    // Analyze motion and audio
+    const motionLevel = await analyzeMotion(clip);
+    const audioEnergy = await analyzeAudioEnergy(audioPath);
+    fs.remove(audioPath).catch(()=>{});
+
+    console.log(`[${jobId}] 🤖 Motion:${motionLevel} Audio:${audioEnergy}`);
+
+    // Pick style based on content
+    if (audioEnergy === 'high' && motionLevel === 'high') return STYLES['football-hype'];
+    if (audioEnergy === 'high' && motionLevel === 'medium') return STYLES['fast-cuts'];
+    if (audioEnergy === 'low'  || motionLevel === 'low')  return STYLES['cinematic'];
+    return STYLES['fast-cuts']; // default
+  } catch(e) {
+    console.warn(`[${jobId}] Auto detection failed, using fast-cuts`);
+    return STYLES['fast-cuts'];
+  }
+}
+
+async function analyzeMotion(clipPath) {
+  return new Promise((resolve) => {
+    const motions = [];
+    ffmpeg(clipPath)
+      .outputOptions(['-vf','fps=3,scale=80:45,showinfo','-f','null'])
+      .output('/dev/null')
+      .on('stderr',(line)=>{
+        const m = line.match(/mean:\[(\d+)/);
+        if (m) motions.push(parseFloat(m[1]));
+      })
+      .on('end',()=>{
+        if (!motions.length) return resolve('medium');
+        const diffs=[];
+        for(let i=1;i<motions.length;i++) diffs.push(Math.abs(motions[i]-motions[i-1]));
+        const avgDiff=diffs.reduce((a,b)=>a+b,0)/(diffs.length||1);
+        resolve(avgDiff>20?'high':avgDiff>8?'medium':'low');
+      })
+      .on('error',()=>resolve('medium'))
+      .run();
+  });
+}
+
+async function analyzeAudioEnergy(audioPath) {
+  return new Promise((resolve) => {
+    const rms=[];
+    ffmpeg(audioPath)
+      .outputOptions(['-af','astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-','-f','null'])
+      .output('/dev/null')
+      .on('stderr',(line)=>{
+        const m=line.match(/lavfi\.astats\.Overall\.RMS_level=(-?\d+\.?\d*)/);
+        if(m)rms.push(parseFloat(m[1]));
+      })
+      .on('end',()=>{
+        if(!rms.length)return resolve('medium');
+        const avg=rms.reduce((a,b)=>a+b,0)/rms.length;
+        resolve(avg>-10?'high':avg>-20?'medium':'low');
+      })
+      .on('error',()=>resolve('medium'))
+      .run();
+  });
+}
 
 // ── LUT FILTER ────────────────────────────────────────────────
 function getLUTFilter(lutStyle) {
@@ -58,8 +125,8 @@ function getLUTFilter(lutStyle) {
 
 // ── BEAT DETECTION ────────────────────────────────────────────
 async function detectBeats(audioPath, preset) {
-  return new Promise((resolve) => {
-    const peaks = [];
+  return new Promise((resolve)=>{
+    const peaks=[];
     ffmpeg(audioPath)
       .outputOptions(['-af','astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-','-f','null','-vn'])
       .output('/dev/null')
@@ -68,10 +135,10 @@ async function detectBeats(audioPath, preset) {
         if(m){const r=parseFloat(m[1]);if(r>-20)peaks.push({time:peaks.length*0.1,rms:r});}
       })
       .on('end',()=>{
-        if(peaks.length<3) return resolve(fallbackBeats(preset));
+        if(peaks.length<3)return resolve(fallbackBeats(preset));
         const top=[...peaks].sort((a,b)=>b.rms-a.rms).slice(0,40).map(p=>p.time).sort((a,b)=>a-b);
         const f=[top[0]];
-        for(let i=1;i<top.length;i++){if(top[i]-f[f.length-1]>=0.3)f.push(top[i]);}
+        for(let i=1;i<top.length;i++){if(top[i]-f[f.length-1]>=0.2)f.push(top[i]);}
         resolve(f);
       })
       .on('error',()=>resolve(fallbackBeats(preset)))
@@ -82,9 +149,8 @@ async function detectBeats(audioPath, preset) {
 function fallbackBeats(preset) {
   const [min,max]=preset.bpmRange||[100,140];
   const bpm=min+Math.random()*(max-min);
-  const interval=60/bpm;
   const b=[];
-  for(let t=0;t<120;t+=interval)b.push(parseFloat(t.toFixed(3)));
+  for(let t=0;t<120;t+=60/bpm)b.push(parseFloat(t.toFixed(3)));
   return b;
 }
 
@@ -95,6 +161,7 @@ function snapToBeat(time,beats,tightness,tol=0.25){
   return d<=tol?time+(n-time)*tightness:time;
 }
 
+// ── VIDEO UTILS ───────────────────────────────────────────────
 function getVideoInfo(f){
   return new Promise((res,rej)=>{
     ffmpeg.ffprobe(f,(err,m)=>{
@@ -112,6 +179,7 @@ function extractAudio(i,o){
   });
 }
 
+// ── PROCESS SEGMENT ───────────────────────────────────────────
 function processSegment({input,start,duration,preset,format,outputPath,segIndex}){
   return new Promise((res,rej)=>{
     const fmt=FORMATS[format];
@@ -123,7 +191,7 @@ function processSegment({input,start,duration,preset,format,outputPath,segIndex}
     const lut=getLUTFilter(preset.lutStyle);if(lut)vf.push(lut);
     if(preset.useZoomPunches&&segIndex%3===0&&fmt){
       const fd=duration/spd;
-      vf.push(`zoompan=z='if(lte(on,${Math.ceil(0.15*30)}),1.07,1.0)':d=${Math.ceil(fd*30)}:s=${fmt.w}x${fmt.h}`);
+      vf.push(`zoompan=z='if(lte(on,${Math.ceil(0.2*30)}),1.07,1.0)':d=${Math.ceil(fd*30)}:s=${fmt.w}x${fmt.h}`);
     }
     if(preset.useShakeEffect&&segIndex%4===0){
       vf.push(`crop=iw-16:ih-16:${segIndex%2===0?8:0}:${segIndex%3===0?8:0}`);
@@ -154,7 +222,7 @@ function applyWatermark(i,o,format){
   return new Promise((res,rej)=>{
     const fmt=FORMATS[format]||FORMATS['9:16'];
     const fs2=fmt?Math.round(fmt.w*0.022):22;
-    ffmpeg(i).videoFilter([`drawtext=text='𝙿𝙾𝚆𝙴𝚁𝙴𝙳 𝙱𝚈 𝙼𝙰𝙸𝙾𝚁 𝚃𝙴𝙲𝙷 𝙸𝙽𝙲':fontsize=${fs2}:fontcolor=white@0.55:x=w-text_w-20:y=h-text_h-20:shadowcolor=black@0.4:shadowx=1:shadowy=1:box=1:boxcolor=black@0.15:boxborderw=6`])
+    ffmpeg(i).videoFilter([`drawtext=text='POWERED BY MAYOR TECH INC':fontsize=${fs2}:fontcolor=white@0.55:x=w-text_w-20:y=h-text_h-20:shadowcolor=black@0.4:shadowx=1:shadowy=1:box=1:boxcolor=black@0.2:boxborderw=6`])
     .outputOptions(['-c:v','libx264','-preset','fast','-crf','22','-c:a','copy','-movflags','+faststart'])
     .output(o).on('end',res).on('error',rej).run();
   });
@@ -175,49 +243,46 @@ function concatSegments(segs,out){
 
 // ── MAIN PIPELINE ─────────────────────────────────────────────
 async function processVideo({ jobId, clips, reference, style, format, outputPath, addWatermark, onProgress }) {
-  const tempDir = `./temp/${jobId}`;
+  const tempDir=`./temp/${jobId}`;
   fs.ensureDirSync(tempDir);
 
   try {
-    // ════════════════════════════════════════════════════════
-    // BLUEPRINT MODE — Reference video uploaded
-    // Creates frame-by-frame clone of the reference edit
-    // ════════════════════════════════════════════════════════
-    if (reference) {
-      console.log(`[${jobId}] 🔬 BLUEPRINT MODE — cloning reference edit style`);
-      await onProgress(10);
 
+    // ═══════════════════════════════════════════════════════
+    // MODE 1: BLUEPRINT — reference video = exact clone
+    // ═══════════════════════════════════════════════════════
+    if (reference) {
+      console.log(`[${jobId}] 🔬 BLUEPRINT MODE`);
+      await onProgress(10);
       const blueprint = await createBlueprint(reference, jobId);
       await onProgress(20);
-
-      await executeBlueprint({
-        blueprint,
-        clips,
-        format,
-        outputPath,
-        addWatermark,
-        jobId,
-        onProgress: async(p) => await onProgress(20 + Math.floor(p*0.8))
-      });
-
-      return; // done!
+      await executeBlueprint({ blueprint, clips, format, outputPath, addWatermark, jobId,
+        onProgress: async(p)=>await onProgress(20+Math.floor(p*0.8)) });
+      return;
     }
 
-    // ════════════════════════════════════════════════════════
-    // PRESET MODE — No reference, use style preset
-    // ════════════════════════════════════════════════════════
-    const preset = STYLES[style] || STYLES['fast-cuts'];
-    console.log(`[${jobId}] 🎨 PRESET MODE — using style: ${preset.label}`);
+    // ═══════════════════════════════════════════════════════
+    // MODE 2: PRESET — style selected
+    // MODE 3: AUTO   — no style = Mayor Cut decides
+    // ═══════════════════════════════════════════════════════
+    let preset;
+    if (!style || style === 'auto') {
+      preset = await detectAutoStyle(clips, jobId);
+      console.log(`[${jobId}] 🤖 AUTO MODE → picked: ${preset.label}`);
+    } else {
+      preset = STYLES[style] || STYLES['fast-cuts'];
+      console.log(`[${jobId}] 🎨 PRESET MODE: ${preset.label}`);
+    }
     await onProgress(15);
 
-    // Extract audio + detect beats
-    const audioPath = path.join(tempDir,'audio.wav');
-    await extractAudio(clips[0], audioPath);
+    // Beat detection
+    const audioPath=path.join(tempDir,'audio.wav');
+    await extractAudio(clips[0],audioPath);
     await onProgress(20);
 
     let beats=[];
-    try{ beats=await detectBeats(audioPath,preset); }
-    catch{ beats=fallbackBeats(preset); }
+    try{beats=await detectBeats(audioPath,preset);}
+    catch{beats=fallbackBeats(preset);}
     await onProgress(28);
 
     // Plan segments
@@ -246,7 +311,7 @@ async function processVideo({ jobId, clips, reference, style, format, outputPath
     }
 
     if(!segments.length)throw new Error('No usable segments found.');
-    console.log(`[${jobId}] 📐 Planned ${segments.length} segments`);
+    console.log(`[${jobId}] 📐 ${segments.length} segments planned`);
 
     let total=0;const finals=[];
     for(const s of segments){if(total>=preset.maxOutput)break;finals.push(s);total+=s.duration/(preset.speed||1);}
@@ -259,7 +324,7 @@ async function processVideo({ jobId, clips, reference, style, format, outputPath
       try{
         await processSegment({input:seg.file,start:seg.start,duration:seg.duration,preset,format,outputPath:out,segIndex:i});
         segPaths.push(out);
-      }catch(e){console.warn(`[${jobId}] Seg ${i} failed: ${e.message}`);}
+      }catch(e){console.warn(`[${jobId}] Seg ${i}: ${e.message}`);}
       await onProgress(35+Math.floor((i/finals.length)*52));
     }
 
@@ -279,11 +344,11 @@ async function processVideo({ jobId, clips, reference, style, format, outputPath
     }
 
     await onProgress(100);
-    console.log(`[${jobId}] ✅ Done → ${outputPath}`);
+    console.log(`[${jobId}] ✅ Done!`);
 
   } finally {
     fs.remove(tempDir).catch(()=>{});
   }
 }
 
-module.exports = { processVideo, STYLES };
+module.exports = { processVideo, STYLES }; 
