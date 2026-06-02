@@ -108,7 +108,7 @@ app.post('/process/:jobId', async (req, res) => {
         activeJobs.set(jobId, { ...activeJobs.get(jobId), progress: p });
         // Throttle worker updates to every 20% to avoid spam
         if (p % 20 === 0) {
-          await notifyWorker(jobId, { status: 'processing', progress: p });
+          await notifyProgress(jobId, p);
         }
       }
     });
@@ -172,3 +172,20 @@ app.listen(PORT, () => {
   console.log(`   Running on http://localhost:${PORT}`);
   console.log(`   Worker URL: ${WORKER_URL}\n`);
 });
+
+// Progress-specific notify (lighter call)
+async function notifyProgress(jobId, progress) {
+  try {
+    await fetch(`${WORKER_URL}/api/job/progress`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jobId,
+        progress,
+        processorSecret: PROCESSOR_SECRET
+      })
+    });
+  } catch (e) {
+    console.warn(`Progress update failed for job ${jobId}`);
+  }
+}
