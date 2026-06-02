@@ -25,11 +25,16 @@ const cors    = require('cors');
 const path    = require('path');
 const fs      = require('fs-extra');
 const ffmpeg  = require('fluent-ffmpeg');
-const ffmpegStatic = require('ffmpeg-static');
 const { pipeline } = require('stream/promises');
 const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
 
-ffmpeg.setFfmpegPath(ffmpegStatic);
+// Use the full FFmpeg installed via the Dockerfile (apt), which includes
+// drawtext and every other filter. ffmpeg-static lacked drawtext.
+ffmpeg.setFfmpegPath('/usr/bin/ffmpeg');
+ffmpeg.setFfprobePath('/usr/bin/ffprobe');
+
+// Font for drawtext (installed by fonts-dejavu-core in the Dockerfile)
+const FONT_FILE = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
 
 const PORT             = process.env.PORT || 8080;
 const WORKER_URL       = process.env.WORKER_URL || 'http://localhost:8787';
@@ -159,7 +164,7 @@ function applyWatermark(input, out, fmt) {
   return new Promise((resolve, reject) => {
     const fontSize = Math.round(fmt.w * 0.024);
     ffmpeg(input)
-      .videoFilter(`drawtext=text='MayorCut':fontsize=${fontSize}:fontcolor=white@0.6:x=w-text_w-24:y=h-text_h-24:shadowcolor=black@0.4:shadowx=1:shadowy=1:box=1:boxcolor=black@0.2:boxborderw=6`)
+      .videoFilter(`drawtext=fontfile='${FONT_FILE}':text='MayorCut':fontsize=${fontSize}:fontcolor=white@0.6:x=w-text_w-24:y=h-text_h-24:shadowcolor=black@0.4:shadowx=1:shadowy=1:box=1:boxcolor=black@0.2:boxborderw=6`)
       .outputOptions(['-c:v', 'libx264', '-preset', 'fast', '-crf', '21', '-c:a', 'copy', '-movflags', '+faststart'])
       .output(out).on('end', resolve).on('error', reject).run();
   });
@@ -287,4 +292,3 @@ const server = app.listen(PORT, () => {
 server.requestTimeout = 0;
 server.headersTimeout = 0;
 server.setTimeout(3600000);
-
