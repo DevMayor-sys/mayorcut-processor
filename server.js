@@ -179,6 +179,225 @@ function applyWatermark(input, out, fmt) {
   });
 }
 
+// ── Templates (Phase 2: starting with one, tuned well) ──────
+const TEMPLATES = {
+  'fast-cuts': {
+    minCut: 0.45, maxCut: 1.4, beatsPerCut: 1,
+    color: { brightness: 0.03, contrast: 1.12, saturation: 1.18 },
+    flashEvery: 4,   // subtle white flash every Nth cut
+    zoomEvery: 3,    // gentle zoom on every Nth cut
+  },
+};
+
+// Detect beats from the music using RMS peaks at real timestamps.
+function detectBeats(filePath) {
+  return new Promise((resolve) => {
+    const rms = [];
+    let curT = 0;
+    ffmpeg(filePath)
+      .outputOptions(['-af', 'astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level', '-f', 'null', '-vn'])
+      .output('/dev/null')
+      .on('stderr', (line) => {
+        const t = line.match(/pts_time:(\d+\.?\d*)/);
+        if (t) curT = parseFloat(t[1]);
+        const m = line.match(/RMS_level=(-?\d+\.?\d*)/);
+        if (m) { const v = parseFloat(m[1]); if (isFinite(v)) rms.push({ time: curT, rms: v }); }
+      })
+      .on('end', () => {
+        if (rms.length < 8) return resolve([]);
+        const avg = rms.reduce((a, b) => a + b.rms, 0) / rms.length;
+        const peaks = [];
+        for (let i = 1; i < rms.length - 1; i++) {
+          if (rms[i].rms > avg + 3 && rms[i].rms >= rms[i - 1].rms && rms[i].rms >= rms[i + 1].rms) {
+            peaks.push(rms[i].time);
+          }
+        }
+        const beats = peaks.length ? [peaks[0]] : [];
+        for (let i = 1; i < peaks.length; i++) {
+          if (peaks[i] - beats[beats.length - 1] >= 0.25) beats.push(peaks[i]);
+        }
+        resolve(beats);
+      })
+      .on('error', () => resolve([]))
+      .run();
+  });
+}
+
+// Score a clip's high-motion, well-exposed moments.
+function analyzeClipMoments(clipPath) {
+  return new Promise((resolve) => {
+    ffmpeg.ffprobe(clipPath, (err, meta) => {
+      const duration = err ? 8 : (meta.format.duration || 8);
+      const frames = [];
+      ffmpeg(clipPath)
+        .outputOptions(['-vf', 'fps=4,scale=64:36,showinfo', '-f', 'null'])
+        .output('/dev/null')
+        .on('stderr', (line) => {
+          const pts = line.match(/pts_time:(\d+\.?\d*)/);
+          const mean = line.match(/mean:\[(\d+)/);
+          if (pts && mean) frames.push({ time: parseFloat(pts[1]), b: parseFloat(mean[1]) });
+        })
+        .on('end', () => {
+          const moments = [];
+          for (let i = 1; i < frames.length; i++) {
+            moments.push({ time: frames[i].time, motion: Math.abs(frames[i].b - frames[i - 1].b), bright: frames[i].b });
+          }
+          const ranked = moments.filter(m => m.bright > 40 && m.bright < 230).sort((a, b) => b.motion - a.motion);
+          const best = [];
+          for (const m of ranked) {
+            if (best.length >= 8) break;
+            if (best.every(t => Math.abs(t - m.time) > 1.5)) best.push(m.time);
+          }
+          best.sort((a, b) => a - b);
+          resolve({ path: clipPath, duration, bestMoments: best.length ? best : [duration * 0.1] });
+        })
+        .on('error', () => resolve({ path: clipPath, duration, bestMoments: [duration * 0.1] }))
+        .run();
+    });
+  });
+}
+
+function median(arr) {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+}
+
+// Walk the beats, place cuts, assign each cut a clip's best moment.
+function buildBeatTimeline(beats, clipInfos, tpl, maxDuration) {
+  const intervals = [];
+  for (let i = 1; i < beats.length; i++) intervals.push(beats[i] - beats[i - 1]);
+  const medInt = median(intervals) || 0.5;
+  let beatsPerCut = tpl.beatsPerCut;
+  while (medInt * beatsPerCut < tpl.minCut) beatsPerCut++;
+
+  const timeline = [];
+  let clipIdx = 0, sceneIdx = 0;
+  for (let b = 0; b + beatsPerCut < beats.length; b += beatsPerCut) {
+    const start = beats[b];
+    if (start >= maxDuration) break;
+    let dur = beats[b + beatsPerCut] - start;
+    if (dur < tpl.minCut) continue;
+    if (dur > tpl.maxCut) dur = tpl.maxCut;
+
+    const clip = clipInfos[clipIdx % clipInfos.length];
+    const moment = clip.bestMoments[sceneIdx % clip.bestMoments.length] || 0;
+    const clipStart = Math.max(0, Math.min(moment, clip.duration - dur - 0.2));
+
+    timeline.push({
+      clipPath: clip.path,
+      clipStart,
+      duration: dur,
+      flash: sceneIdx > 0 && sceneIdx % tpl.flashEvery === 0,
+      zoom: sceneIdx % tpl.zoomEvery === 0,
+    });
+    clipIdx++; sceneIdx++;
+  }
+  return timeline;
+}
+
+// Render one beat-synced segment, video-only (music added later).
+function renderSegment(seg, fmt, tpl, outPath) {
+  return new Promise((resolve, reject) => {
+    const vf = [
+      `scale=${fmt.w}:${fmt.h}:force_original_aspect_ratio=increase`,
+      `crop=${fmt.w}:${fmt.h}`,
+      `fps=30`, `setsar=1`,
+      `eq=brightness=${tpl.color.brightness}:contrast=${tpl.color.contrast}:saturation=${tpl.color.saturation}`,
+    ];
+    // Gentle static zoom (reliable; no zoompan frame-count quirks)
+    if (seg.zoom) {
+      vf.push(`scale=${Math.round(fmt.w * 1.07)}:${Math.round(fmt.h * 1.07)}`);
+      vf.push(`crop=${fmt.w}:${fmt.h}`);
+    }
+    const fd = seg.duration;
+    vf.push(`fade=t=in:st=0:d=0.04`);
+    vf.push(`fade=t=out:st=${Math.max(0, fd - 0.04).toFixed(3)}:d=0.04`);
+    if (seg.flash) vf.push(`fade=t=in:st=0:d=0.05:color=white`);
+
+    ffmpeg(seg.clipPath)
+      .inputOptions([`-ss ${seg.clipStart.toFixed(3)}`, `-t ${seg.duration.toFixed(3)}`])
+      .videoFilter(vf.join(','))
+      .outputOptions([
+        '-an',
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '21', '-pix_fmt', 'yuv420p',
+        '-r', '30', '-movflags', '+faststart', '-avoid_negative_ts', 'make_zero',
+      ])
+      .output(outPath).on('end', resolve).on('error', reject).run();
+  });
+}
+
+function concatVideoOnly(segs, out) {
+  return new Promise((resolve, reject) => {
+    const list = out + '.txt';
+    fs.writeFileSync(list, segs.map(s => `file '${path.resolve(s)}'`).join('\n'));
+    ffmpeg().input(list).inputOptions(['-f', 'concat', '-safe', '0'])
+      .outputOptions(['-an', '-c:v', 'libx264', '-preset', 'fast', '-crf', '21', '-pix_fmt', 'yuv420p', '-r', '30', '-movflags', '+faststart'])
+      .output(out)
+      .on('end', () => { fs.remove(list).catch(() => {}); resolve(); })
+      .on('error', (e) => { fs.remove(list).catch(() => {}); reject(e); })
+      .run();
+  });
+}
+
+function addMusicTrack(video, music, out, jobId) {
+  return new Promise((resolve, reject) => {
+    ffmpeg().input(video).input(music)
+      .outputOptions(['-map', '0:v', '-map', '1:a', '-c:v', 'copy', '-c:a', 'aac', '-ar', '44100', '-b:a', '192k', '-shortest', '-movflags', '+faststart'])
+      .output(out)
+      .on('end', resolve)
+      .on('error', (e) => { console.error(`[${jobId}] ⚠️ add music failed: ${e.message}`); fs.copy(video, out).then(resolve).catch(reject); })
+      .run();
+  });
+}
+
+// Beat-synced render (used when music is present).
+async function renderFastCuts({ clips, music, format, addWatermark, outPath, workDir, jobId, onProgress }) {
+  const fmt = FORMATS[format] || FORMATS['9:16'];
+  const tpl = TEMPLATES['fast-cuts'];
+
+  const beats = await detectBeats(music);
+  console.log(`[${jobId}] 🎵 ${beats.length} beats detected`);
+  if (beats.length < 4) {
+    console.log(`[${jobId}] too few beats — falling back to simple join`);
+    return renderSimple({ clips, music, format, addWatermark, outPath, workDir, jobId, onProgress });
+  }
+  await onProgress(15);
+
+  const clipInfos = [];
+  for (const c of clips) clipInfos.push(await analyzeClipMoments(c));
+  await onProgress(30);
+
+  const musicDur = await clipDuration(music);
+  const maxDur = Math.min(musicDur, 60);
+  const timeline = buildBeatTimeline(beats, clipInfos, tpl, maxDur);
+  console.log(`[${jobId}] 📋 ${timeline.length} beat-synced cuts`);
+  if (!timeline.length) {
+    return renderSimple({ clips, music, format, addWatermark, outPath, workDir, jobId, onProgress });
+  }
+  await onProgress(35);
+
+  const segs = [];
+  for (let i = 0; i < timeline.length; i++) {
+    const out = path.join(workDir, `seg_${String(i).padStart(4, '0')}.mp4`);
+    try { await renderSegment(timeline[i], fmt, tpl, out); segs.push(out); }
+    catch (e) { console.warn(`[${jobId}] seg ${i} failed: ${e.message}`); }
+    await onProgress(35 + Math.floor((i / timeline.length) * 40));
+  }
+  if (!segs.length) throw new Error('no segments rendered');
+
+  const concatV = path.join(workDir, 'concatv.mp4');
+  await concatVideoOnly(segs, concatV);
+  await onProgress(80);
+
+  const withMusic = path.join(workDir, 'withmusic.mp4');
+  await addMusicTrack(concatV, music, withMusic, jobId);
+  await onProgress(90);
+
+  if (addWatermark) await applyWatermark(withMusic, outPath, fmt);
+  else await fs.move(withMusic, outPath, { overwrite: true });
+}
+
 // ── Simple render pipeline ───────────────────────────────────
 async function renderSimple({ clips, music, format, addWatermark, outPath, workDir, jobId, onProgress }) {
   const fmt = FORMATS[format] || FORMATS['9:16'];
@@ -291,9 +510,11 @@ app.post('/process/:jobId', async (req, res) => {
     }
     await notifyWorker(jobId, { status: 'processing', progress: 35 });
 
-    // 2. Render
+    // 2. Render — beat-synced if music is present, simple join otherwise
     const outPath = path.join(workDir, 'output.mp4');
-    await renderSimple({
+    const renderFn = localMusic ? renderFastCuts : renderSimple;
+    console.log(`[${jobId}] render mode: ${localMusic ? 'beat-synced fast-cuts' : 'simple join'}`);
+    await renderFn({
       clips: localClips,
       music: localMusic,
       format: manifest.format || '9:16',
