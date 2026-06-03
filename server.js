@@ -27,6 +27,7 @@ const fs      = require('fs-extra');
 const ffmpeg  = require('fluent-ffmpeg');
 const { pipeline } = require('stream/promises');
 const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { CloudTasksClient } = require('@google-cloud/tasks');
 
 // Use the full FFmpeg installed via the Dockerfile (apt), which includes
 // drawtext and every other filter. ffmpeg-static lacked drawtext.
@@ -43,6 +44,14 @@ const PROCESSOR_SECRET = process.env.PROCESSOR_SECRET || 'dev-secret';
 // Non-sensitive defaults (overridable via env)
 const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || '959d378fb62b30a5f1680b7079ec3ef7';
 const R2_BUCKET     = process.env.R2_BUCKET     || 'mayorcut';
+
+// Cloud Tasks config
+const GCP_PROJECT   = process.env.GCP_PROJECT   || 'mayorcut';
+const TASKS_LOCATION = process.env.TASKS_LOCATION || 'us-west1';
+const TASKS_QUEUE   = process.env.TASKS_QUEUE   || 'mayorcut-renders';
+const SELF_URL      = process.env.PUBLIC_URL    || 'https://mayorcut-processor-659177949207.us-west1.run.app';
+
+const tasksClient = new CloudTasksClient();
 
 const s3 = new S3Client({
   region: 'auto',
@@ -213,6 +222,39 @@ async function renderSimple({ clips, music, format, addWatermark, outPath, workD
 // ── Endpoints ────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'MayorCut Processor', r2Bucket: R2_BUCKET });
+});
+
+// ENQUEUE — called by the Worker. Creates a Cloud Task that will
+// call /process. The task is durable: if /process fails or the
+// instance dies mid-render, Cloud Tasks retries automatically.
+// body: { processorSecret, manifest }
+app.post('/enqueue/:jobId', async (req, res) => {
+  const { jobId } = req.params;
+  const { processorSecret, manifest } = req.body || {};
+
+  if (processorSecret !== PROCESSOR_SECRET) return res.status(401).json({ error: 'unauthorized' });
+  if (!manifest) return res.status(400).json({ error: 'manifest required' });
+
+  try {
+    const parent = tasksClient.queuePath(GCP_PROJECT, TASKS_LOCATION, TASKS_QUEUE);
+    const task = {
+      httpRequest: {
+        httpMethod: 'POST',
+        url: `${SELF_URL}/process/${jobId}`,
+        headers: { 'Content-Type': 'application/json' },
+        body: Buffer.from(JSON.stringify({ processorSecret: PROCESSOR_SECRET, manifest })).toString('base64'),
+      },
+      // Give the render plenty of time before Cloud Tasks considers it failed.
+      dispatchDeadline: { seconds: 1800 },
+    };
+
+    const [created] = await tasksClient.createTask({ parent, task });
+    console.log(`[${jobId}] 📥 enqueued task: ${created.name}`);
+    res.json({ success: true, jobId, task: created.name });
+  } catch (err) {
+    console.error(`[${jobId}] ❌ enqueue failed: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // SYNCHRONOUS render. Returns 200 only when the output is in R2.
